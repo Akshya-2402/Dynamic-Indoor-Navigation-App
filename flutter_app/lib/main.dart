@@ -1,7 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:typed_data';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 import 'pdr_models.dart';
@@ -51,16 +51,24 @@ class NavigationPage extends StatefulWidget {
 }
 
 class _NavigationPageState extends State<NavigationPage> {
-  final _startController = TextEditingController(text: 'Room 101');
+  String _defaultBackendUrl() {
+    if (kIsWeb) {
+      return 'http://127.0.0.1:5000';
+    }
+    if (defaultTargetPlatform == TargetPlatform.android) {
+      return 'http://127.0.0.1:5000';
+    }
+    return 'http://127.0.0.1:5000';
+  }
+
+  final _startController = TextEditingController(text: '101');
   final _endController = TextEditingController(text: 'Exit');
   final _floorController = TextEditingController();
   final _xController = TextEditingController();
   final _yController = TextEditingController();
   final _headingController = TextEditingController(text: '90');
   final _stepLengthController = TextEditingController(text: '0.7');
-  final _baseUrlController = TextEditingController(
-    text: 'http://localhost:5000',
-  );
+  final _baseUrlController = TextEditingController();
   final _crowdStartsController = TextEditingController(text: 'G26, G27, G28');
   final _crowdEndController = TextEditingController(text: 'Exit');
   final _crowdTimeController = TextEditingController(text: '10');
@@ -76,10 +84,17 @@ class _NavigationPageState extends State<NavigationPage> {
   String? _activePdrRoom;
   Map<String, dynamic>? _crowdResult;
   Map<String, dynamic>? _crowdRoute;
+  Timer? _crowdRefreshTimer;
+  Timer? _pdrTrackingTimer;
+  bool _liveCrowd = false;
+  bool _pdrTracking = false;
+  final String _pdrUserId = 'pdr_user_1';
+  DateTime? _lastCrowdUpdate;
 
   @override
   void initState() {
     super.initState();
+    _baseUrlController.text = _defaultBackendUrl();
     _startController.addListener(_onStartRoomChanged);
     _checkConnection();
   }
@@ -109,6 +124,8 @@ class _NavigationPageState extends State<NavigationPage> {
     _crowdTimeController.dispose();
     _crowdSpeedController.dispose();
     _crowdRadiusController.dispose();
+    _crowdRefreshTimer?.cancel();
+    _pdrTrackingTimer?.cancel();
     super.dispose();
   }
 
@@ -255,6 +272,7 @@ class _NavigationPageState extends State<NavigationPage> {
         _crowdResult = Map<String, dynamic>.from(decoded);
         _status = 'Crowd simulation complete';
       });
+      _startCrowdRefresh();
     } catch (e) {
       setState(() {
         _error = e.toString();
@@ -262,6 +280,34 @@ class _NavigationPageState extends State<NavigationPage> {
       });
     } finally {
       setState(() => _loading = false);
+    }
+  }
+
+  void _startCrowdRefresh() {
+    _crowdRefreshTimer?.cancel();
+    _liveCrowd = true;
+    _refreshCrowdStatus();
+    _crowdRefreshTimer = Timer.periodic(
+      const Duration(seconds: 2),
+      (_) => _refreshCrowdStatus(),
+    );
+  }
+
+  Future<void> _refreshCrowdStatus() async {
+    final url = _baseUrlController.text.trim();
+    if (url.isEmpty || !mounted) return;
+    try {
+      final response = await http.get(Uri.parse('$url/crowd_status'));
+      if (response.statusCode != 200) return;
+      final decoded = jsonDecode(response.body);
+      if (!mounted || decoded is! Map<String, dynamic>) return;
+      setState(() {
+        _crowdResult = decoded;
+        _lastCrowdUpdate = DateTime.now();
+        _status = 'Live crowd status updated';
+      });
+    } catch (_) {
+      // Keep the last successful crowd result visible during a brief outage.
     }
   }
 
@@ -462,6 +508,10 @@ class _NavigationPageState extends State<NavigationPage> {
           _yController.text = position[1].toString();
           _status = 'PDR step successful';
         });
+        if (_pdrTracking) {
+          await _publishPdrPosition();
+          await _refreshDynamicRoute();
+        }
       } else {
         final decoded = jsonDecode(response.body);
         setState(() {
@@ -479,6 +529,68 @@ class _NavigationPageState extends State<NavigationPage> {
         _loading = false;
       });
     }
+  }
+
+  Future<void> _publishPdrPosition() async {
+    final url = _baseUrlController.text.trim();
+    final floor = _floorController.text.trim();
+    final x = double.tryParse(_xController.text.trim());
+    final y = double.tryParse(_yController.text.trim());
+    if (url.isEmpty || floor.isEmpty || x == null || y == null) return;
+    await http.post(
+      Uri.parse('$url/user_position'),
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode({
+        'user_id': _pdrUserId,
+        'floor': floor,
+        'x': x,
+        'y': y,
+      }),
+    );
+  }
+
+  Future<void> _refreshDynamicRoute() async {
+    final url = _baseUrlController.text.trim();
+    final start = _startController.text.trim();
+    final end = _endController.text.trim();
+    if (url.isEmpty || start.isEmpty || end.isEmpty) return;
+    final response = await http.post(
+      Uri.parse('$url/get_path'),
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode({
+        'start': start,
+        'end': end,
+        'avoid_crowd': true,
+        'format': 'json',
+      }),
+    );
+    if (response.statusCode == 200 && mounted) {
+      setState(() {
+        _crowdRoute = Map<String, dynamic>.from(jsonDecode(response.body));
+      });
+    }
+  }
+
+  void _startPdrTracking() {
+    if (_pdrTracking) return;
+    setState(() {
+      _pdrTracking = true;
+      _status = 'Live PDR tracking started';
+    });
+    _pdrStep();
+    _pdrTrackingTimer = Timer.periodic(
+      const Duration(seconds: 2),
+      (_) => _pdrStep(),
+    );
+  }
+
+  void _stopPdrTracking() {
+    _pdrTrackingTimer?.cancel();
+    _pdrTrackingTimer = null;
+    setState(() {
+      _pdrTracking = false;
+      _status = 'Live PDR tracking stopped';
+    });
   }
 
   Widget _buildResultCard() {
@@ -526,9 +638,14 @@ class _NavigationPageState extends State<NavigationPage> {
 
   Widget _buildCrowdCard() {
     final locations = (_crowdResult?['locations'] as List?)?.length ?? 0;
-    final observations = (_crowdResult?['observations'] as List?)?.length ?? 0;
     final flooded = _crowdResult?['flooded_nodes'] ?? 0;
-    final hotspots = _crowdResult?['hotspots']?.length ?? 0;
+    final hotspotCount = (_crowdResult?['hotspot_count'] as int?) ??
+        (_crowdResult?['hotspots']?.length ?? 0);
+    final peopleCount = (_crowdResult?['people_count'] as int?) ??
+        (_crowdResult?['observations'] as List?)?.length ??
+        0;
+    final activeUsers = _crowdResult?['active_users'] ?? peopleCount;
+    final live = _liveCrowd || _crowdResult?['live'] == true;
     return Card(
       child: Padding(
         padding: const EdgeInsets.all(16),
@@ -616,18 +733,41 @@ class _NavigationPageState extends State<NavigationPage> {
             ),
             if (_crowdResult != null) ...[
               const SizedBox(height: 12),
+              Row(
+                children: [
+                  Icon(
+                    Icons.circle,
+                    size: 10,
+                    color: live ? Colors.green : Colors.grey,
+                  ),
+                  const SizedBox(width: 6),
+                  Text(
+                    live
+                        ? 'LIVE · $activeUsers active users'
+                        : 'Snapshot',
+                    style: const TextStyle(fontWeight: FontWeight.w700),
+                  ),
+                  if (_lastCrowdUpdate != null) ...[
+                    const SizedBox(width: 10),
+                    Text(
+                      'Updated ${_lastCrowdUpdate!.hour.toString().padLeft(2, '0')}:${_lastCrowdUpdate!.minute.toString().padLeft(2, '0')}:${_lastCrowdUpdate!.second.toString().padLeft(2, '0')}',
+                    ),
+                  ],
+                ],
+              ),
+              const SizedBox(height: 8),
               Wrap(
                 spacing: 16,
                 runSpacing: 6,
                 children: [
                   Text(
                     locations > 0
-                        ? 'Users placed: $locations'
-                        : 'Occupancy sources: $observations',
+                        ? 'Users placed: $peopleCount'
+                        : 'Occupancy sources: $peopleCount',
                     style: const TextStyle(fontWeight: FontWeight.w700),
                   ),
+                  Text('Hotspot locations: $hotspotCount'),
                   Text('Flooded nodes: $flooded'),
-                  Text('Hotspots: $hotspots'),
                 ],
               ),
               if ((_crowdResult!['errors'] as List?)?.isNotEmpty ?? false)
@@ -896,6 +1036,20 @@ class _NavigationPageState extends State<NavigationPage> {
                                       icon: const Icon(Icons.directions_walk),
                                       label: const Text('Run PDR step'),
                                     ),
+                                    ElevatedButton.icon(
+                                      onPressed: _loading || _pdrTracking
+                                          ? null
+                                          : _startPdrTracking,
+                                      icon: const Icon(Icons.play_arrow),
+                                      label: const Text('Start live tracking'),
+                                    ),
+                                    OutlinedButton.icon(
+                                      onPressed: _pdrTracking
+                                          ? _stopPdrTracking
+                                          : null,
+                                      icon: const Icon(Icons.stop),
+                                      label: const Text('Stop tracking'),
+                                    ),
                                   ],
                                 ),
                               ],
@@ -918,6 +1072,28 @@ class _NavigationPageState extends State<NavigationPage> {
                           fontSize: 21,
                           fontWeight: FontWeight.w800,
                         ),
+                      ),
+                      const SizedBox(height: 10),
+                      Wrap(
+                        spacing: 18,
+                        children: [
+                          Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Icon(Icons.star, color: Colors.green.shade600),
+                              const SizedBox(width: 5),
+                              Text('START: ${_startController.text.trim()}'),
+                            ],
+                          ),
+                          Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              const Icon(Icons.star, color: Colors.blue),
+                              const SizedBox(width: 5),
+                              Text('END: ${_endController.text.trim()}'),
+                            ],
+                          ),
+                        ],
                       ),
                       const SizedBox(height: 10),
                       Card(

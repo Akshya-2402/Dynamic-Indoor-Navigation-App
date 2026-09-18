@@ -12,9 +12,17 @@ import os
 import difflib
 import math
 import re
+import threading
+import time
 
 app = Flask(__name__)
 CORS(app)
+
+ACTIVE_USER_TIMEOUT_SECONDS = 10.0
+active_users = {}
+active_users_lock = threading.RLock()
+crowd_observations = []
+crowd_settings = {"radius_m": 25.0, "max_count": 20.0}
 
 # --- CONFIG ---
 ROOM_TYPE = "Type"
@@ -24,7 +32,7 @@ GEOJSON_PATHS = {
     "Level_2": "geojsons/first_floor.geojson",
     "Level_3": "geojsons/second_floor.geojson",
 }
-CORRIDOR_PATTERN = re.compile(r'^(c\d+|corridor|corriodr)$', re.IGNORECASE)
+CORRIDOR_PATTERN = re.compile(r'^(c\d+|corridor|corri?odr)$', re.IGNORECASE)
 
 ROOM_DOOR_MAP = {
     # Ground Floor
@@ -115,6 +123,7 @@ ROOM_DOOR_MAP = {
     '225': 'C3',
     '226': 'C1',
     '227': 'C1',
+    'S105': 'C14',
 }
 
 # --- SAFE LOAD GEOJSONS ---
@@ -274,6 +283,15 @@ def connect_to_corridor_node(point, G):
     return nearest
 
 
+def offset_point_by_meters(x, y, heading_deg, step_length):
+    """Move a projected map coordinate by one PDR step."""
+    heading_rad = math.radians(heading_deg)
+    return (
+        x + step_length * math.cos(heading_rad),
+        y + step_length * math.sin(heading_rad),
+    )
+
+
 def get_room_connection(room):
     floor = room["floor"]
     anchor = room_connection_nodes.get(id(room))
@@ -430,8 +448,11 @@ match_candidates = sorted(list(set(room_name_list + room_type_list)))
 # --- MATCHING FUNCTIONS ---
 def canonical(s):
     if s is None:
-        return ""
+        return "", ""
     s2 = str(s).strip().lower()
+    s2 = re.sub(r"^(room|room no|room no\.|classroom|lab|office)\s*", "", s2)
+    s2 = s2.replace("_", " ").replace("-", " ")
+    s2 = re.sub(r"\s+", " ", s2).strip()
     s_alnum = "".join(ch for ch in s2 if ch.isalnum())
     return s2, s_alnum
 
@@ -442,18 +463,20 @@ def find_best_match(input_str):
     q_raw, q_alnum = canonical(input_str)
 
     for r in all_rooms:
-        if r["room_name"].strip().lower() == q_raw:
+        r_name = canonical(r["room_name"])[0]
+        if r_name == q_raw:
             connection, centroid = get_room_connection(r)
             return connection, centroid, [r["room_name"]]
 
     for r in all_rooms:
-        if r["room_type"].strip().lower() == q_raw:
+        r_type = canonical(r["room_type"])[0]
+        if r_type == q_raw:
             connection, centroid = get_room_connection(r)
             return connection, centroid, [r["room_type"]]
 
     substr_matches = []
     for r in all_rooms:
-        rn = r["room_name"].strip().lower()
+        rn = canonical(r["room_name"])[0]
         if q_raw and q_raw in rn:
             substr_matches.append(r)
     if substr_matches:
@@ -463,13 +486,13 @@ def find_best_match(input_str):
 
     if q_alnum:
         for r in all_rooms:
-            rn_alnum = "".join(ch for ch in r["room_name"].strip().lower() if ch.isalnum())
+            rn_alnum = "".join(ch for ch in canonical(r["room_name"])[0] if ch.isalnum())
             if rn_alnum and rn_alnum == q_alnum:
                 connection, centroid = get_room_connection(r)
                 return connection, centroid, [r["room_name"]]
 
     for r in all_rooms:
-        rt = r["room_type"].strip().lower()
+        rt = canonical(r["room_type"])[0]
         if q_raw and q_raw in rt:
             connection, centroid = get_room_connection(r)
             return connection, centroid, [r["room_type"]]
@@ -548,11 +571,12 @@ def resolve_crowd_observation(observation):
         return None
 
     if isinstance(room_value, str) and room_value.strip():
-        resolved_floor, centroid, _ = resolve_room_position(room_value)
-        if resolved_floor is not None and centroid is not None:
-            floor_hint = floor_hint or resolved_floor
-            x_value = x_value if x_value is not None else centroid.x
-            y_value = y_value if y_value is not None else centroid.y
+        connection, centroid, _ = find_best_match(room_value)
+        if connection is not None and centroid is not None:
+            floor_hint = floor_hint or connection[0]
+            connection_node = connection[1]
+            x_value = x_value if x_value is not None else connection_node[0]
+            y_value = y_value if y_value is not None else connection_node[1]
 
     if floor_hint is None and x_value is not None and y_value is not None:
         for floor_name, G in floor_graphs.items():
@@ -584,6 +608,39 @@ def resolve_crowd_observation(observation):
     return (floor_name, node), count
 
 
+def crowd_radius_in_graph_units(floor, radius_m):
+    """Convert the user-facing meter radius to the floor graph's units."""
+    gdf = floor_gdfs.get(floor)
+    if gdf is None or gdf.crs is None or not gdf.crs.is_geographic:
+        return radius_m
+
+    latitude = float(gdf.geometry.unary_union.centroid.y)
+    meters_per_degree = 111320.0 * math.cos(math.radians(latitude))
+    return radius_m / max(1.0, meters_per_degree)
+
+
+def graph_edge_distance_meters(from_node, to_node):
+    """Return a graph edge length in meters across projected and geographic floors."""
+    if from_node[0] != to_node[0]:
+        return G_all.edges[from_node, to_node].get("weight", 1.0)
+
+    floor = from_node[0]
+    base_weight = G_all.edges[from_node, to_node].get("weight", 1.0)
+    gdf = floor_gdfs.get(floor)
+    if gdf is None or gdf.crs is None or not gdf.crs.is_geographic:
+        return base_weight
+
+    from_point = Point(from_node[1])
+    to_point = Point(to_node[1])
+    latitude = (from_point.y + to_point.y) / 2
+    meters_per_degree_x = 111320.0 * math.cos(math.radians(latitude))
+    meters_per_degree_y = 111320.0
+    return math.hypot(
+        (to_point.x - from_point.x) * meters_per_degree_x,
+        (to_point.y - from_point.y) * meters_per_degree_y,
+    )
+
+
 def flood_crowd_field(observations, radius_m=25.0, max_count=20.0):
     """Propagate crowd intensity from samples across the corridor graph."""
     field = {}
@@ -597,8 +654,9 @@ def flood_crowd_field(observations, radius_m=25.0, max_count=20.0):
     max_count = max(1.0, float(max_count))
     for seed, count in seeds:
         floor = seed[0]
+        graph_radius = crowd_radius_in_graph_units(floor, radius_m)
         distances = nx.single_source_dijkstra_path_length(
-            floor_graphs[floor], seed[1], cutoff=radius_m, weight="weight"
+            floor_graphs[floor], seed[1], cutoff=graph_radius, weight="weight"
         )
         for node, distance in distances.items():
             intensity = min(1.0, count / max_count) * max(0.0, 1.0 - distance / radius_m)
@@ -607,11 +665,39 @@ def flood_crowd_field(observations, radius_m=25.0, max_count=20.0):
     return field, seeds
 
 
+def build_hotspot_summary(observations, field, radius_m):
+    """Return a clearer crowd summary with separate user and hotspot counts."""
+    hotspots = [
+        {"floor": floor, "x": node[0], "y": node[1], "intensity": round(intensity, 3)}
+        for (floor, node), intensity in field.items()
+        if intensity >= 0.2
+    ]
+    hotspots.sort(key=lambda item: item["intensity"], reverse=True)
+    occupied_nodes = set()
+    for observation in observations:
+        resolved = resolve_crowd_observation(observation)
+        if resolved:
+            occupied_nodes.add(resolved[0])
+    people_count = 0
+    for observation in observations:
+        if isinstance(observation, dict):
+            count = observation.get("count")
+            if isinstance(count, (int, float)):
+                people_count += int(count)
+    return {
+        "hotspots": hotspots,
+        "hotspot_count": len(occupied_nodes),
+        "people_count": people_count,
+        "flooded_nodes": len(field),
+        "radius_m": radius_m,
+    }
+
+
 def crowd_weighted_graph(crowd_field, crowd_weight=4.0):
     """Copy the route graph and penalize edges passing through crowded nodes."""
     weighted = G_all.copy()
     for u, v, data in weighted.edges(data=True):
-        base_weight = data.get("weight", 1.0)
+        base_weight = graph_edge_distance_meters(u, v)
         crowd = (crowd_field.get(u, 0.0) + crowd_field.get(v, 0.0)) / 2
         data["weight"] = base_weight * (1.0 + max(0.0, crowd_weight) * crowd)
     return weighted
@@ -625,7 +711,7 @@ def route_details(start_node, end_node, crowd_field=None, crowd_weight=4.0):
     distance = 0.0
     crowd_exposure = 0.0
     for from_node, to_node in zip(path_nodes, path_nodes[1:]):
-        base = G_all.edges[from_node, to_node].get("weight", 0.0)
+        base = graph_edge_distance_meters(from_node, to_node)
         distance += base
         crowd_exposure += base * (crowd_field.get(from_node, 0.0) + crowd_field.get(to_node, 0.0)) / 2
     return path_nodes, distance, crowd_exposure
@@ -689,7 +775,7 @@ def simulate_crowd(users, timestamp):
         remaining_distance = max(0.0, (sample_time - start_time) * speed)
         current_node = path[-1]
         for from_node, to_node in zip(path, path[1:]):
-            edge_distance = G_all.edges[from_node, to_node].get("weight", 0.0)
+            edge_distance = graph_edge_distance_meters(from_node, to_node)
             if remaining_distance <= edge_distance:
                 current_node = from_node if edge_distance == 0 else from_node
                 break
@@ -801,6 +887,39 @@ def scheduled_occupancy(clock_time):
         "totals": summary,
     }
 
+
+def get_active_user_observations():
+    """Return live users as crowd observations and remove stale heartbeats."""
+    now = time.time()
+    with active_users_lock:
+        stale_ids = [
+            user_id
+            for user_id, user in active_users.items()
+            if now - user["last_seen"] > ACTIVE_USER_TIMEOUT_SECONDS
+        ]
+        for user_id in stale_ids:
+            del active_users[user_id]
+
+        return [
+            {
+                "user_id": user_id,
+                "floor": user["floor"],
+                "x": user["x"],
+                "y": user["y"],
+                "count": 1,
+                "source": "live_user",
+            }
+            for user_id, user in active_users.items()
+        ]
+
+
+def crowd_response(observations, radius_m, max_count):
+    """Build the common crowd response used by live and manual updates."""
+    field, _ = flood_crowd_field(observations, radius_m, max_count)
+    summary = build_hotspot_summary(observations, field, radius_m)
+    return {"observations": observations, **summary}
+
+
 # --- ROUTES ---
 @app.route("/")
 def home():
@@ -809,6 +928,37 @@ def home():
 @app.route("/health")
 def health():
     return jsonify({"status": "ok"})
+
+
+@app.route("/user_position", methods=["POST"])
+def user_position():
+    """Record one user's latest position for live crowd tracking."""
+    data = request.get_json() or {}
+    user_id = str(data.get("user_id", "")).strip()
+    floor = str(data.get("floor", "")).strip()
+    if not user_id or not floor or data.get("x") is None or data.get("y") is None:
+        return jsonify({"error": "user_id, floor, x, and y are required"}), 400
+    if floor not in floor_graphs:
+        return jsonify({"error": f"Unknown floor: {floor}"}), 400
+    try:
+        x_coord = float(data["x"])
+        y_coord = float(data["y"])
+    except (TypeError, ValueError):
+        return jsonify({"error": "x and y must be numbers"}), 400
+
+    with active_users_lock:
+        active_users[user_id] = {
+            "floor": floor,
+            "x": x_coord,
+            "y": y_coord,
+            "last_seen": time.time(),
+        }
+
+    return jsonify({
+        "status": "updated",
+        "user_id": user_id,
+        "active_users": len(get_active_user_observations()),
+    })
 
 
 @app.route("/crowd_status", methods=["GET", "POST"])
@@ -820,7 +970,19 @@ def crowd_status():
     Each observation may use ``room`` or ``floor``, ``x``, ``y``.
     """
     global crowd_observations, crowd_settings
-    data = request.get_json() or {}
+    data = request.get_json(silent=True) or {}
+    if request.method == "GET":
+        live_observations = get_active_user_observations()
+        if live_observations:
+            return jsonify({
+                **crowd_response(
+                    live_observations,
+                    crowd_settings["radius_m"],
+                    crowd_settings["max_count"],
+                ),
+                "live": True,
+                "active_users": len(live_observations),
+            })
     if request.method == "POST":
         observations = data.get("observations", [])
         if not isinstance(observations, list):
@@ -841,14 +1003,8 @@ def crowd_status():
     except (TypeError, ValueError):
         return jsonify({"error": "radius_m and max_count must be numbers"}), 400
 
-    hotspots = [
-        {"floor": floor, "x": node[0], "y": node[1], "intensity": round(intensity, 3)}
-        for (floor, node), intensity in field.items()
-        if intensity >= 0.2
-    ]
-    hotspots.sort(key=lambda item: item["intensity"], reverse=True)
-    return jsonify({"observations": crowd_observations, "hotspots": hotspots,
-                    "flooded_nodes": len(field), "radius_m": radius_m})
+    summary = build_hotspot_summary(crowd_observations, field, radius_m)
+    return jsonify({"observations": crowd_observations, **summary, "live": False})
 
 
 @app.route("/occupancy_status", methods=["GET", "POST"])
@@ -869,13 +1025,8 @@ def occupancy_status():
     crowd_observations = observations
     crowd_settings = {"radius_m": radius_m, "max_count": max_count}
     field, _ = flood_crowd_field(observations, radius_m, max_count)
-    hotspots = [
-        {"floor": floor, "x": node[0], "y": node[1], "intensity": round(intensity, 3)}
-        for (floor, node), intensity in field.items() if intensity >= 0.2
-    ]
-    hotspots.sort(key=lambda item: item["intensity"], reverse=True)
-    return jsonify({"schedule": schedule, "observations": observations,
-                    "hotspots": hotspots, "flooded_nodes": len(field)})
+    summary = build_hotspot_summary(observations, field, radius_m)
+    return jsonify({"schedule": schedule, "observations": observations, **summary})
 
 
 @app.route("/simulate_crowd", methods=["POST"])
@@ -901,19 +1052,14 @@ def simulate_crowd_endpoint():
     crowd_observations = observations
     crowd_settings = {"radius_m": radius_m, "max_count": max_count}
     field, _ = flood_crowd_field(observations, radius_m, max_count)
-    hotspots = [
-        {"floor": floor, "x": node[0], "y": node[1], "intensity": round(intensity, 3)}
-        for (floor, node), intensity in field.items()
-        if intensity >= 0.2
-    ]
-    hotspots.sort(key=lambda item: item["intensity"], reverse=True)
+    summary = build_hotspot_summary(observations, field, radius_m)
     return jsonify({
         "timestamp": timestamp,
         "locations": locations,
         "observations": observations,
-        "hotspots": hotspots,
-        "flooded_nodes": len(field),
         "errors": errors,
+        "user_count": len(locations),
+        **summary,
     })
 
 @app.route("/debug_rooms")
@@ -963,7 +1109,7 @@ def map_match():
     except Exception:
         return jsonify({"error": "Invalid coordinates"}), 400
 
-    nearest = connect_to_corridor_point(pt, floor_corridor_lines.get(floor))
+    nearest = connect_to_corridor_node(pt, G)
     if nearest:
         return jsonify({"input": [float(x), float(y)], "matched": [float(nearest[0]), float(nearest[1])], "floor": floor})
     else:
@@ -1015,7 +1161,7 @@ def pdr_step():
     G = floor_graphs.get(floor)
     matched = None
     if G is not None and len(G.nodes) > 0:
-        nearest = connect_to_corridor_point(Point((nx, ny)), floor_corridor_lines.get(floor))
+        nearest = connect_to_corridor_node(Point((nx, ny)), G)
         if nearest:
             matched = [float(nearest[0]), float(nearest[1])]
 
@@ -1061,7 +1207,20 @@ def get_path():
         best_len = float("inf")
         best_cent = None
         for r in exit_rooms:
-            enode = connect_to_corridor_node(Point(r["coords"]), floor_graphs[r["floor"]])
+            exit_corridor = get_door_corridor(
+                r["room_name"], r.get("geom"), floor_gdfs[r["floor"]]
+            )
+            exit_geometry = get_corridor_geometry(exit_corridor, floor_gdfs[r["floor"]])
+            exit_point = Point(r["coords"])
+            if exit_geometry is not None:
+                exit_point, _ = nearest_points(r["geom"], exit_geometry)
+            enode = connect_to_corridor(
+                exit_point,
+                floor_graphs[r["floor"]],
+                target_corridor=exit_corridor,
+                room_geom=r.get("geom"),
+                corridor_geom=exit_geometry,
+            )
             if not enode:
                 continue
             try:
@@ -1098,7 +1257,10 @@ def get_path():
             "distance_m": round(route_distance, 2),
             "crowd_exposure": round(crowd_exposure, 2),
             "crowd_avoided": use_crowd,
-            "hotspots": sum(1 for value in crowd_field.values() if value >= 0.2),
+            "people_count": sum(
+                1 for _ in crowd_seeds
+            ),
+            "hotspot_count": sum(1 for value in crowd_field.values() if value >= 0.2),
         })
 
     route_floors = []
@@ -1141,9 +1303,22 @@ def get_path():
                 )
 
         # draw path
-        for start_node, end_node in floor_segments.get(floor, []):
-            seg = LineString([start_node, end_node])
+        for segment_start, segment_end in floor_segments.get(floor, []):
+            seg = LineString([segment_start, segment_end])
             ax.plot(*seg.xy, linewidth=2, linestyle="--", color="blue", zorder=5)
+
+        if floor == start_node[0] and start_centroid is not None:
+            ax.plot(
+                [start_centroid.x, start_node[1][0]],
+                [start_centroid.y, start_node[1][1]],
+                linewidth=2, linestyle="-", color="green", zorder=5,
+            )
+        if floor == end_node[0] and end_centroid is not None:
+            ax.plot(
+                [end_node[1][0], end_centroid.x],
+                [end_node[1][1], end_centroid.y],
+                linewidth=2, linestyle="-", color="red", zorder=5,
+            )
 
         if use_crowd:
             for (crowd_floor, crowd_node), intensity in crowd_field.items():
@@ -1160,9 +1335,35 @@ def get_path():
 
         # start and end
         if floor == start_node[0]:
-            ax.scatter(start_centroid.x, start_centroid.y, s=100, color="green", zorder=8)
+            ax.scatter(
+                start_node[1][0], start_node[1][1], s=300,
+                color="limegreen", edgecolors="black", linewidths=1.5,
+                marker="*", zorder=12,
+            )
+            ax.annotate(
+                f"START: {start_in}",
+                xy=(start_node[1][0], start_node[1][1]),
+                xytext=(12, 14), textcoords="offset points",
+                ha="left", va="bottom", color="black", weight="bold",
+                bbox=dict(facecolor="limegreen", edgecolor="black", pad=3),
+                arrowprops=dict(arrowstyle="->", color="black", linewidth=1.5),
+                zorder=13,
+            )
         if floor == end_node[0]:
-            ax.scatter(end_centroid.x, end_centroid.y, s=100, color="blue", zorder=8)
+            ax.scatter(
+                end_node[1][0], end_node[1][1], s=300,
+                color="dodgerblue", edgecolors="black", linewidths=1.5,
+                marker="*", zorder=12,
+            )
+            ax.annotate(
+                f"END: {end_in}",
+                xy=(end_node[1][0], end_node[1][1]),
+                xytext=(12, -18), textcoords="offset points",
+                ha="left", va="top", color="white", weight="bold",
+                bbox=dict(facecolor="dodgerblue", edgecolor="black", pad=3),
+                arrowprops=dict(arrowstyle="->", color="black", linewidth=1.5),
+                zorder=13,
+            )
 
         ax.set_title(f"Path on {floor}")
         ax.axis("off")
@@ -1175,6 +1376,6 @@ def get_path():
     return send_file(buf, mimetype="image/png")
 
 if __name__ == "__main__":
-    app.run(debug=False, use_reloader=False, host="0.0.0.0", port=5000)
+    app.run(debug=False, use_reloader=False, host="127.0.0.1", port=5000)
 
 
